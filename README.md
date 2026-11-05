@@ -14,16 +14,6 @@ aap_api_cli.py logs 42 --tail 50
 aap_api_cli.py                 # interactive shell
 ```
 
-> **Status:** `0.1`. Authentication and API discovery have been validated on a
-> real AAP 2.5 installation. The business commands (`logs`, `whoami`, …) were
-> fixed after that validation but have not yet been re-run against the target.
-> See [Limitations](#limitations) before relying on it operationally.
-
-> **Renamed in 0.1:** the script was `rhaap_api_cli.py`. The config and history
-> files are now `~/.aap_api_cli.conf` and `~/.aap_api_cli_history`; there is no
-> fallback to the old config path. `RHAAP_PROFILE` and `RHAAP_DEBUG` remain
-> accepted as aliases for `AAP_PROFILE` and `AAP_DEBUG`.
-
 ---
 
 ## Requirements
@@ -363,5 +353,3 @@ AAP_DEBUG=1 ./aap_api_cli.py endpoints
   a match beyond the limit is not seen.
 - `--fields` is ignored outside `json`/`yaml`.
 
-For architecture, discovery internals, and maintenance traps, read
-[`AGENTS.md`](AGENTS.md).
