@@ -1,48 +1,40 @@
 # aap_api_cli
 
-A single-file, dependency-free command-line client for the **Red Hat Ansible
-Automation Platform (AAP) 2.5** REST API.
+**A small, dependency-free companion for exploring Red Hat Ansible Automation
+Platform (AAP) 2.5 from your terminal.**
 
-It is a diagnostic tool: it discovers which API bases the server actually
-publishes, handles the gateway/controller split, and exposes job templates, job
-runs, logs, users, and arbitrary API calls.
+It is one executable Python file. 
+No package installation, no virtual environment, or build step is required.
 
-```
-aap_api_cli.py templates --name patch
-aap_api_cli.py jobs --limit 10 --output json | jq '.[0]'
-aap_api_cli.py logs 42 --tail 50
-aap_api_cli.py                 # interactive shell
-```
+AAP installations do not always expose the same URL layout: the gateway and
+controller may live on different bases, and a reverse proxy can add another
+layer of surprise. This CLI asks the server what it actually publishes, then
+helps you inspect templates, jobs, stdout, users, and the raw API without
+memorising those paths.
 
----
+## Start here
 
-## Requirements
+### 1. Run the script
 
-- Python **3.8+** (developed and run on 3.14)
-- Network access to the AAP gateway and, if separate, the controller
-- No pip package, no virtualenv, no build step
-- `readline` is optional; without it the one-shot CLI still works and the
-  interactive shell loses history/Tab completion
+You need Python **3.8+** and network access to your AAP gateway (and controller
+if it is hosted separately). `readline` is optional; without it, one-shot
+commands still work but the interactive shell has no history or Tab completion.
 
-## Installation
-
-Copy the script somewhere on `PATH` and make it executable:
-
-```bash
-install -m 755 aap_api_cli.py ~/.local/bin/aap_api_cli
-# or keep the original name:
-# install -m 755 aap_api_cli.py ~/.local/bin/aap_api_cli.py
-```
-
-From the repository you can also run it directly:
+Run it directly from this repository:
 
 ```bash
 ./aap_api_cli.py --version
 ```
 
-## Configuration
+Or install it somewhere on your `PATH`:
 
-Create a config file with the built-in template:
+```bash
+install -m 755 aap_api_cli.py ~/.local/bin/aap_api_cli
+```
+
+### 2. Tell it how to reach AAP
+
+Generate a private configuration file, then add your host and user:
 
 ```bash
 ./aap_api_cli.py --generate-config > ~/.aap_api_cli.conf
@@ -50,23 +42,46 @@ chmod 600 ~/.aap_api_cli.conf
 $EDITOR ~/.aap_api_cli.conf
 ```
 
-Minimal example:
+The smallest useful configuration looks like this:
 
 ```ini
 [default]
 host = aap.apps.example.internal
 user = admin
 pass = CHANGEME
-tls_insecure = true
 auth_method = basic
 timeout = 30
 
-# Prefer an internal CA over disabling verification:
+# Prefer an internal CA over disabling certificate verification:
 # ca_bundle = ~/.internal-ca.pem
 ```
 
-On the next run, a `CHANGEME` password triggers an interactive prompt instead of
-producing an obscure `401`.
+`CHANGEME` deliberately triggers a password prompt rather than sending a known
+placeholder to the server. For a test environment only, `tls_insecure = true`
+is available and produces a warning on every run.
+
+### 3. Find a template, its jobs, and their logs
+
+Most people come here to answer three questions: *which template should I
+use?*, *what happened to its recent jobs?*, and *what does a particular run
+say?* Start with that familiar path:
+
+```bash
+./aap_api_cli.py templates --name inventory       # find a template
+./aap_api_cli.py jobs --template "Daily inventory check" # inspect its runs
+./aap_api_cli.py logs 8174 --tail 50              # read one run's stdout
+```
+
+Run `./aap_api_cli.py` with no command to open an interactive shell. It has
+history, Tab completion, and built-in `help`.
+
+If those commands cannot find a resource, `./aap_api_cli.py endpoints` shows
+the API bases and endpoints discovered on that AAP installation.
+
+> The regular commands only make `GET` requests. The `api` command is a
+> deliberate diagnostic escape hatch and can send writes when asked to do so.
+
+## Connection details
 
 ### Profiles
 
@@ -87,14 +102,14 @@ pass = CHANGEME
 ```
 
 Select one with `-P/--profile`, the `AAP_PROFILE` environment variable, or let
-the tool use the only profile / `[default]`.
+the tool choose the only profile (or `[default]`):
 
 ```bash
 ./aap_api_cli.py --list-profiles
 ./aap_api_cli.py -P controller status
 ```
 
-### Supported keys
+### Supported configuration keys
 
 | Key | Aliases | Meaning |
 |---|---|---|
@@ -155,9 +170,10 @@ job_templates = /api/controller/v2/job_templates/
 Paths must start with `/` or `http`. The same override is available per command
 with `--endpoint key=/path`; it is not persisted.
 
-## Usage
+## Everyday use
 
-One-shot commands:
+Here are a few useful one-shot commands. Add `--output json`, `--output csv`,
+or `--output yaml` whenever the result is going into another tool:
 
 ```bash
 ./aap_api_cli.py status                 # gateway status + ping
@@ -168,8 +184,49 @@ One-shot commands:
 ```
 
 Without a command, the tool opens an interactive shell with history and Tab
-completion. `help`, `help <command>`, `history`, `exit`/`quit`/`Ctrl-D` work
+completion. `help`, `help <command>`, `history`, `exit`/`quit`/`Ctrl-D` all work
 there.
+
+### The usual path: templates → jobs → logs
+
+The following interactive session uses entirely fictional names, IDs, dates,
+and log content. It is the normal investigation flow on a real platform.
+Commands are plural: use `templates`, not `template`.
+
+```text
+aap> templates --name inventory
+id    name                     organization  type  last_run
+1042  Daily inventory check    Default       run   2026-04-18T07:30:12Z
+1061  Inventory report (test)  Default       run   2026-04-17T16:10:43Z
+(2 item(s))
+
+aap> jobs --template "Daily inventory check" --limit 3
+id    name                   template               status      elapsed  finished
+8174  Daily inventory check  Daily inventory check  failed      42.118   2026-04-18T07:30:12Z
+8169  Daily inventory check  Daily inventory check  successful  39.804   2026-04-17T07:30:11Z
+8164  Daily inventory check  Daily inventory check  successful  41.006   2026-04-16T07:30:12Z
+(3 item(s))
+
+aap> logs 8174 --tail 4
+TASK [Validate managed hosts] *************************************************
+fatal: [node-01.example.test]: FAILED! => {"msg": "inventory service unavailable"}
+PLAY RECAP *******************************************************************
+node-01.example.test : ok=8 changed=0 unreachable=0 failed=1
+```
+
+For the most recent run of a template, you can jump straight to its output:
+
+```bash
+./aap_api_cli.py logs --template "Daily inventory check" --tail 50
+```
+
+When looking for failures across all templates, narrow the job list first, then
+open the relevant log:
+
+```bash
+./aap_api_cli.py jobs --status failed --limit 20
+./aap_api_cli.py logs 8174 --grep 'failed|unreachable' --tail 80
+```
 
 ### Global options
 
@@ -189,7 +246,7 @@ Useful on any command:
 | `-v/--verbose` | Same as `AAP_DEBUG=1` |
 | `--version` | Print the version |
 
-### Commands
+### Command reference
 
 | Command | Purpose | Main options |
 |---|---|---|
@@ -203,7 +260,7 @@ Useful on any command:
 | `users` | Gateway users | — |
 | `organizations` | Gateway organizations | — |
 
-### Job logs
+### Reading job logs
 
 Accepted job forms:
 
@@ -261,7 +318,7 @@ Examples:
 ./aap_api_cli.py api /api/controller/v2/users/ --output csv
 ```
 
-### Arbitrary API calls
+### Inspecting arbitrary API endpoints
 
 `api` is the diagnostic escape hatch. It sends exactly what you ask for:
 
@@ -275,7 +332,7 @@ Examples:
 `-d/--body` switches the default `GET` to `POST`; use `-X` for another method.
 Invalid JSON is a named error, not a traceback.
 
-## Security
+## Stay safe
 
 - Business commands are **read-only**: they issue `GET` requests.
 - `api` is deliberately unrestricted and **can mutate the server**. Read-only
@@ -289,7 +346,7 @@ Invalid JSON is a named error, not a traceback.
 - Prefer `--password-stdin`/`--password-env`/`--password-cmd` and the config file
   for tokens over command-line arguments.
 
-## Tests
+## Developing and testing
 
 The test suite is self-contained: it starts its own mock AAP server on a free
 port, writes a temporary config, runs, then cleans up. No mock needs to be
@@ -321,7 +378,7 @@ python3 -m unittest discover -s tests -v
 `RHAAP_PROFILE` and `RHAAP_DEBUG` remain accepted as legacy aliases for scripts
 written before the rename to `AAP_*`.
 
-## Troubleshooting
+## When something does not work
 
 Enable tracing first:
 
@@ -341,7 +398,7 @@ AAP_DEBUG=1 ./aap_api_cli.py endpoints
   this from an authentication failure on purpose. It is intentionally short;
   run with `AAP_DEBUG=1` to see the probed bases.
 
-## Limitations
+## Current limitations
 
 - `0.1`: the business commands still need revalidation against the real target.
 - The test mock does not model a real `/api/controller/v2/` and only serves
