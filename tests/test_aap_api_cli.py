@@ -289,6 +289,20 @@ def want_no(*forbidden):
     return verify
 
 
+def want_order(*needles):
+    """Les `needles` doivent apparaitre dans cet ordre dans stdout."""
+    def verify(out, _err):
+        positions = []
+        for needle in needles:
+            index = out.find(needle)
+            if index < 0:
+                fail('%r absent de stdout' % needle)
+            positions.append(index)
+        if positions != sorted(positions):
+            fail('ordre incorrect: %r' % (needles,))
+    return verify
+
+
 def want_line(label, needle, present=True):
     """La derniere ligne contenant `label` doit (ou non) contenir `needle`.
 
@@ -323,6 +337,16 @@ def suite_config():
           verify=want_out('testuser'))
     check('--generate-config complete', ['--generate-config'],
           want_out('[default]', 'tls_insecure', 'auth_method', 'host ='))
+    check('--generate-config: priorite des mots de passe',
+          ['--generate-config'],
+          want_order('--password-stdin', '--password-env', '--password-cmd',
+                     '`pass` key'))
+    check('--generate-config: endpoints controleur valides',
+          ['--generate-config'],
+          want_out('/api/controller/v2/job_templates/',
+                   '/api/controller/v2/jobs/'))
+    check('--generate-config: plus de chemin fantome',
+          ['--generate-config'], want_no('/api/controller/api/v2/'))
     check('--version', ['--version'])
     check('--help sortie 0', ['--help'])
     check('config absente -> conseil --generate-config',
@@ -348,6 +372,17 @@ def suite_auth():
           lambda o, e: None if want_json(o).get('username') == 'testuser' else fail('username'))
     check('whoami --output csv', LOCAL + ['whoami', '--output', 'csv'],
           want_out('field,value', 'testuser'))
+    check('whoami masque le hash par defaut',
+          LOCAL + ['whoami', '--output', 'json'],
+          lambda o, e: None if 'pbkdf2' not in o and 'masked' in e
+          else fail('hash visible ou avertissement absent'))
+    check('whoami --full expose le hash',
+          LOCAL + ['whoami', '--full', '--output', 'json'],
+          want_out('pbkdf2'))
+    check('whoami: avertissement coherent avec --full',
+          LOCAL + ['whoami'], want_err('exposes the password hash'))
+    check('whoami: message trompeur retire',
+          LOCAL + ['whoami'], want_no('remains a secret'))
     check('alias de cles (login/password)',
           ['-f', CONF, '-P', 'alias_keys', 'whoami'], want_out('testuser'))
     check('auth session: csrf + referer + cookie',
@@ -363,10 +398,21 @@ def suite_auth():
           want_out('tokenuser'))
     check('status agrege status+ping', LOCAL + ['status'],
           want_out('application_version', '2.5.0'))
+    check('status --output csv: structures en JSON',
+          LOCAL + ['status', '--output', 'csv'],
+          lambda o, e: None if '""database""' in o and "'database'" not in o
+          else fail('structure non JSON: %r' % o[:200]))
     check('passe invalide -> 401 et conseil',
           LOCAL + ['--user', 'testuser', '--password-stdin', 'whoami'],
           stdin='mauvais-passe\n', expect=1,
           verify=want_err('credentials', 'TIP'))
+    check('login 403 -> TIP role, pas le conseil Basic generique',
+          LOCAL + ['--endpoint', 'me=/api/gateway/v1/forbidden/',
+                   '--endpoint', 'users=/api/gateway/v1/forbidden/', 'whoami'],
+          expect=1,
+          verify=lambda o, e: None
+          if 'role_user_assignments' in e and 'rejects Basic' not in e
+          else fail('403 tip incorrect: %r' % e[:300]))
     check('token invalide -> message', LOCAL + ['--auth', 'token', '--token', 'mauvais', 'whoami'],
           expect=1, verify=want_err('token'))
     check('--auth token sans jeton -> erreur explicite',
@@ -416,11 +462,20 @@ def suite_templates():
     check('--name substring (filtre client)',
           LOCAL + ['templates', '--name', 'patch', '--only-ids'],
           lambda o, e: None if o.split() == ['11'] else fail('attendu 11'))
+    check('--name substring au-dela de --limit',
+          LOCAL + ['templates', '--limit', '2', '--name', 'backup', '--only-ids'],
+          lambda o, e: None if o.split() == ['13'] else fail('attendu 13, got %r' % o))
     check('--fields avec chemin imbrique',
           LOCAL + ['templates', '--output', 'json',
                    '--fields', 'id,name,summary_fields.organization.name'],
           lambda o, e: None if want_json(o)[0]['summary_fields']['organization']['name'] == 'Ops'
           else fail('champ imbrique'))
+    check('--fields en table -> avertissement',
+          LOCAL + ['templates', '--fields', 'id,name'],
+          want_err('--fields', 'ignored'))
+    check('--fields en json -> pas d avertissement',
+          LOCAL + ['templates', '--output', 'json', '--fields', 'id,name'],
+          want_no('is ignored'))
     check('--workflow (endpoint different)', LOCAL + ['templates', '--workflow'],
           want_out('nightly-full'))
     check('--limit respecte', LOCAL + ['templates', '--limit', '2', '--only-ids'],
@@ -436,9 +491,22 @@ def suite_pagination():
           want_lines(r'\buser\d\d\b', 45))
     check('pagination gateway next_url (job_runs)',
           LOCAL + ['jobs', '--limit', '3'], want_out('(3 item(s))'))
+    check('jobs --template exact',
+          LOCAL + ['jobs', '--template', 'deploy-app', '--only-ids'],
+          lambda o, e: None if o.split() == ['102'] else fail('102 attendu, got %r' % o))
+    check('jobs --template substring (fallback client)',
+          LOCAL + ['jobs', '--template', 'patch', '--only-ids'],
+          lambda o, e: None if o.split() == ['101'] else fail('101 attendu, got %r' % o))
     check('--limit borne la sortie', LOCAL + ['users', '--limit', '5'],
           want_out('(5 item(s))'))
     check('--limit 1', LOCAL + ['users', '--limit', '1'], want_out('(1 item(s))'))
+    check('--limit avant la commande', LOCAL + ['--limit', '2', 'templates', '--only-ids'],
+          lambda o, e: None if len(o.split()) == 2 else fail('2 ids attendus'))
+    check('--limit negatif refuse', LOCAL + ['templates', '--limit', '-1'],
+          expect=2, verify=want_clean_error('--limit'))
+    check('--limit 0 -> aucun element',
+          LOCAL + ['templates', '--limit', '0', '--only-ids'],
+          lambda o, e: None if o.strip() == '' else fail('stdout non vide: %r' % o[:80]))
     check('tri par defaut preserve', LOCAL + ['users', '--limit', '3', '--output', 'json'],
           lambda o, e: None if want_json(o)[0]['id'] == 1 else fail('ordre'))
 
@@ -520,6 +588,9 @@ def suite_api():
           want_err('TIP'), expect=1)
     check('503 -> TIP 503', LOCAL + ['api', '/api/gateway/v1/error503/'],
           want_err('TIP'), expect=1)
+    check('pagination: lien vers un autre hote refuse',
+          LOCAL + ['--endpoint', 'users=/api/gateway/v1/foreign_next/', 'users'],
+          expect=1, verify=want_clean_error('another host'))
     check('POST via -d', LOCAL + ['api', '/api/gateway/v1/ping/', '-d', '{"a":1}'],
           expect=1, verify=want_err('405'))
     check('406 tolere (me est une vue DAB)', LOCAL + ['whoami'], want_out('testuser'))
@@ -586,10 +657,21 @@ def suite_robustesse():
           else fail('expected 2 lines, got: %r' % e))
     check('TLS vers un serveur http -> erreur',
           LOCAL + ['--host', 'https://127.0.0.1:%d' % port(), 'status'], expect=1)
+    check('TLS -> TIP ca_bundle conserve jusqu au login',
+          LOCAL + ['--host', 'https://127.0.0.1:%d' % port(), 'whoami'],
+          expect=1, verify=want_err('ca_bundle'))
+    check('status: transport -> no response',
+          LOCAL + ['--no-login', '--host', 'https://127.0.0.1:%d' % port(), 'status'],
+          verify=lambda o, e: None if 'no response' in o and 'HTTP None' not in o
+          else fail('status transport: %r' % o[:200]))
     check('insecure rappele sur du http (sans TLS)',
           LOCAL + ['--no-login', 'endpoints'], want_no('DISABLED'))
     check('AAP_DEBUG trace les requetes',
           LOCAL + ['whoami'], env={'AAP_DEBUG': '1'}, verify=want_err('# >'))
+    check('AAP_DEBUG=0 ne trace pas',
+          LOCAL + ['whoami'], env={'AAP_DEBUG': '0'}, verify=want_no('# >'))
+    check('RHAAP_DEBUG=0 ne trace pas',
+          LOCAL + ['whoami'], env={'RHAAP_DEBUG': '0'}, verify=want_no('# >'))
     check('RHAAP_DEBUG reste accepte (alias)',
           LOCAL + ['whoami'], env={'RHAAP_DEBUG': '1'}, verify=want_err('# >'))
     check('tous les profils listent leurs cles',

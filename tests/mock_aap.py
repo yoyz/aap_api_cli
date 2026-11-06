@@ -168,11 +168,14 @@ class Handler(BaseHTTPRequestHandler):
     # --- table de routes (le routing precede l'auth, comme Django) --------
 
     def routes(self):
-        def paged(source, style='next', filter_name=None):
+        def paged(source, style='next', filter_name=None, filter_template=False):
             def handler(self, qs, path):
                 items = source
                 if filter_name and qs.get('name'):
                     items = [i for i in source if i['name'] == qs['name'][0]]
+                if filter_template and qs.get('job_template__name'):
+                    wanted = qs['job_template__name'][0]
+                    items = [i for i in source if i.get('job_template_name') == wanted]
                 self._send(200, self._paged(items, qs, path, style))
             return handler
 
@@ -212,6 +215,8 @@ class Handler(BaseHTTPRequestHandler):
             (r'^/api/gateway/v1/error406/$', False, lambda s, q, p: s.error_406(q, p)),
             (r'^/api/gateway/v1/error503/$', False, lambda s, q, p: s._send(
                 503, {'detail': 'Service Unavailable'})),
+            (r'^/api/gateway/v1/forbidden/$', True, lambda s, q, p: s._send(
+                403, {'detail': 'Forbidden'})),
             (r'^/api/gateway/v1/nope/$', False, lambda s, q, p: s._not_found()),
             (r'^%sme/$' % GATEWAY, True, lambda s, q, p: s.me_view(q, p)),
             (r'^%ssession/$' % GATEWAY, True, lambda s, q, p: s._send(
@@ -222,7 +227,15 @@ class Handler(BaseHTTPRequestHandler):
             (r'^%susers/$' % GATEWAY, True, paged(USERS)),
             (r'^%sjob_templates/$' % GATEWAY, True, paged(TEMPLATES, filter_name=True)),
             (r'^%sworkflow_job_templates/$' % GATEWAY, True, paged(WORKFLOWS)),
-            (r'^%sjob_runs/$' % GATEWAY, True, paged(RUNS, style='next_url')),
+            (r'^%sjob_runs/$' % GATEWAY, True,
+             paged(RUNS, style='next_url', filter_template=True)),
+            (r'^%sforeign_next/$' % GATEWAY, True, lambda s, q, p: s._send(200, {
+                'count': 2,
+                # Piege : le client ne doit jamais envoyer Authorization ici.
+                'next': 'http://evil.invalid/api/gateway/v1/foreign_next/?page=2',
+                'results': [{'id': 1, 'username': 'user01', 'email': 'u1@lab',
+                             'is_superuser': False, 'is_active': True,
+                             'last_login': None}]})),
             (r'^%sjob_runs/\d+/stdout/?$' % GATEWAY, True,
              lambda s, q, p: s._send(200, JOB_LOG, 'text/plain')),
             (r'^%sjob_runs/\d+/$' % GATEWAY, True, job_detail),
@@ -241,7 +254,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def me_view(self, qs, path):
         return self._send(200, {'username': self._who(), 'email': 'a@b.c',
-                                'is_superuser': True, 'is_system_auditor': False})
+                                'is_superuser': True, 'is_system_auditor': False,
+                                # Champs sensibles : whoami doit les masquer par
+                                # defaut et les reveler seulement avec --full.
+                                'password': 'pbkdf2_sha256$mock$hash',
+                                'internal_note': 'do-not-show'})
 
     # --- dispatch --------------------------------------------------------
 

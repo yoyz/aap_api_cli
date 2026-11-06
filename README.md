@@ -242,6 +242,7 @@ Useful on any command:
 | `--no-login` | Skip the startup authentication check |
 | `--ca-bundle PEM`, `--insecure` | TLS verification controls |
 | `--timeout N` | HTTP timeout |
+| `--limit N` | Maximum number of items (before or after the command) |
 | `--endpoint key=/path` | Override one logical endpoint |
 | `-v/--verbose` | Same as `AAP_DEBUG=1` |
 | `--version` | Print the version |
@@ -307,7 +308,8 @@ Two intentional exceptions:
 
 - `--only-ids` always prints raw IDs, one per line, regardless of `--output`.
   It is meant for pipelines.
-- `--fields` projects fields for `json`/`yaml` only; `table` and `csv` ignore it.
+- `--fields` projects fields for `json`/`yaml` only; `table` and `csv` ignore it
+  and print a warning.
 
 Examples:
 
@@ -360,7 +362,7 @@ MOCK_PORT=18099 python3 tests/test_aap_api_cli.py   # force a port
 ```
 
 For a quick check, `tests/test_smoke.py` is a basic standard-library `unittest`
-suite (8 cases). It is also collected by pytest:
+suite (15 cases). It is also collected by pytest:
 
 ```bash
 python3 tests/test_smoke.py
@@ -372,7 +374,7 @@ python3 -m unittest discover -s tests -v
 | Variable | Effect |
 |---|---|
 | `AAP_PROFILE` | Default profile when `-P` is absent |
-| `AAP_DEBUG=1` | Trace HTTP requests and endpoint resolution on stderr |
+| `AAP_DEBUG=1` | Trace HTTP requests and endpoint resolution on stderr (only truthy values; `0`/`false` disable) |
 | `AAP_PASSE` | Only used when passed via `--password-env AAP_PASSE` |
 
 `RHAAP_PROFILE` and `RHAAP_DEBUG` remain accepted as legacy aliases for scripts
@@ -404,9 +406,5 @@ AAP_DEBUG=1 ./aap_api_cli.py endpoints
 - The test mock does not model a real `/api/controller/v2/` and only serves
   `text/plain` stdout; the `Accept`-negotiation fallback for logs is therefore
   not exercised by the suite.
-- `jobs --template NAME` uses the server-side exact-name filter without a broad
-  client-side fallback (`logs --template` does have one).
-- `templates --name` without `--exact` filters after loading `--limit` items, so
-  a match beyond the limit is not seen.
-- `--fields` is ignored outside `json`/`yaml`.
+- `--fields` is accepted only for `json`/`yaml`; `table`/`csv` print a warning.
 

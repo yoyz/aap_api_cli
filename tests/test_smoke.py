@@ -19,11 +19,17 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import contextlib
+import io
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CLI = [sys.executable, os.path.join(ROOT, 'aap_api_cli.py')]
 MOCK = os.path.join(HERE, 'mock_aap.py')
+
+sys.path.insert(0, ROOT)
+import aap_api_cli  # noqa: E402
 
 
 def free_port():
@@ -146,6 +152,120 @@ class SmokeTest(unittest.TestCase):
         lines = [line for line in proc.stderr.splitlines() if line.strip()]
         self.assertEqual(len(lines), 2, proc.stderr)
         self.assertIn('cannot reach', proc.stderr)
+
+    def test_tls_failure_has_actionable_tip(self):
+        err = aap_api_cli.join_failure('https://aap.example.invalid',
+                                       'CERTIFICATE_VERIFY_FAILED')
+        self.assertTrue(err.transport)
+        self.assertIn('ca_bundle', err.tip)
+        self.assertIn('cannot reach', str(err))
+
+    def test_get_stdout_stops_on_transport_failure(self):
+        client = aap_api_cli.AAPClient(
+            'http://example.invalid',
+            aap_api_cli.Credentials(login='u', passe='p'))
+        calls = []
+
+        def failing(path, **_kwargs):
+            calls.append(path)
+            raise aap_api_cli.AapError('cannot reach', transport=True, tip='tip')
+
+        client.request = failing
+        with self.assertRaises(aap_api_cli.AapError):
+            client.get_stdout('/api/stdout/')
+        self.assertEqual(len(calls), 1)
+
+    def test_candidates_normalizes_base_without_slash(self):
+        client = aap_api_cli.AAPClient(
+            'http://example.invalid',
+            aap_api_cli.Credentials(login='u', passe='p'))
+        client._api_bases = ['/api/controller/v2']
+        client._resource_index = {}
+        tries = client.candidates('job_templates')
+        self.assertNotIn('/api/controller/v2job_templates/', tries)
+        self.assertIn('/api/controller/v2/job_templates/', tries)
+
+    def test_paginated_stops_on_repeating_next(self):
+        client = aap_api_cli.AAPClient(
+            'http://example.invalid',
+            aap_api_cli.Credentials(login='u', passe='p'))
+        calls = []
+
+        def fake_get_json(current, **_kwargs):
+            calls.append(current)
+            return {'count': 100, 'next': current, 'results': [{'id': 1}]}
+
+        client.get_json = fake_get_json
+        items = client.paginated('/x/', limit=10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(items), 1)
+
+    def test_paginated_match_filters_while_paging(self):
+        client = aap_api_cli.AAPClient(
+            'http://example.invalid',
+            aap_api_cli.Credentials(login='u', passe='p'))
+        pages = [
+            {'count': 2, 'next': '/x/?page=2', 'results': [{'id': 1}]},
+            {'count': 2, 'next': None, 'results': [{'id': 2}]},
+        ]
+        calls = []
+
+        def fake_get_json(current, **_kwargs):
+            calls.append(current)
+            return pages.pop(0)
+
+        client.get_json = fake_get_json
+        items = client.paginated('/x/', limit=1,
+                                 match=lambda item: item['id'] >= 2)
+        self.assertEqual(items, [{'id': 2}])
+        self.assertEqual(len(calls), 2)
+
+    def test_shell_runner_survives_keyboard_interrupt(self):
+        original = aap_api_cli.dispatch
+
+        def interrupted(_name, _argv):
+            raise KeyboardInterrupt
+
+        aap_api_cli.dispatch = interrupted
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                aap_api_cli._shell_runner('status')(object(), '')
+        finally:
+            aap_api_cli.dispatch = original
+        self.assertIn('^C', output.getvalue())
+
+    def test_shell_survives_keyboard_interrupt_at_prompt(self):
+        class FakeClient:
+            base = 'http://127.0.0.1:1'
+            auth_method = 'basic'
+
+        original_client = aap_api_cli.app_state.client
+        original_profile = aap_api_cli.app_state.profile
+        aap_api_cli.app_state.client = FakeClient()
+        aap_api_cli.app_state.profile = 'test'
+        answers = iter([KeyboardInterrupt, 'exit'])
+
+        def fake_input(_prompt=''):
+            value = next(answers)
+            if value is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return value
+
+        output = io.StringIO()
+        try:
+            with mock.patch.dict(os.environ, {'HOME': self.tmpdir}), \
+                    mock.patch('builtins.input', fake_input), \
+                    contextlib.redirect_stdout(output):
+                shell = aap_api_cli.AapShell()
+                # Do not touch the real history file of the user.
+                shell.history_path = os.path.join(self.tmpdir, 'history')
+                shell.cmdloop()
+        finally:
+            aap_api_cli.app_state.client = original_client
+            aap_api_cli.app_state.profile = original_profile
+        self.assertIn('^C', output.getvalue())
+        self.assertIn('goodbye', output.getvalue())
 
 
 if __name__ == '__main__':

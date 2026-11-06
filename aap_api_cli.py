@@ -104,6 +104,14 @@ def env_value(name, legacy=None):
     return value
 
 
+def debug_enabled():
+    """
+    HTTP tracing switch. Only an explicit truthy value enables it, so
+    AAP_DEBUG=0 does not turn tracing on by accident.
+    """
+    return bool(yesno(env_value('AAP_DEBUG', 'RHAAP_DEBUG')))
+
+
 def non_negative_int(value):
     """
     argparse type: integer >= 0 (--tail 0 must mean "no line").
@@ -321,7 +329,6 @@ def table(rows, headers, widths, sep='  '):
 # ---------------------------------------------------------------------------
 
 REGISTRY = {}
-ORDER = []
 
 
 def command(name, help_text):
@@ -335,7 +342,6 @@ def command(name, help_text):
             raise RuntimeError('@command(%r) declared twice' % name)
         REGISTRY[name] = {'name': name, 'help': help_text,
                           'action': func, 'options': None}
-        ORDER.append(name)
         return func
     return deco
 
@@ -372,6 +378,22 @@ def transport_tip(base):
             'then `curl -vk %s/api/`' % (host, base))
 
 
+def _is_tls_error(text):
+    """True when a transport failure comes from TLS/certificate verification."""
+    lowered = str(text or '').lower()
+    return any(word in lowered for word in ('tls', 'ssl', 'certificate'))
+
+
+def _failure_reason(text, base):
+    """
+    Reason without a leading `cannot reach <base>: `, so re-wrapping a transport
+    error does not duplicate the host in the message.
+    """
+    text = str(text or 'no response')
+    prefix = 'cannot reach %s: ' % base
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
 def join_failure(base, reason, detail=None):
     """
     Error for "no usable HTTP response".
@@ -382,11 +404,9 @@ def join_failure(base, reason, detail=None):
     `ca_bundle`, not a VPN check.
     """
     text = str(reason or 'no response')
-    lowered = text.lower()
-    tls = any(word in lowered for word in ('tls', 'ssl', 'certificate'))
     return AapError('cannot reach %s: %s' % (base, text),
                     detail=detail, transport=True,
-                    tip=TIP_TLS if tls else transport_tip(base))
+                    tip=TIP_TLS if _is_tls_error(text) else transport_tip(base))
 
 
 class AapError(Exception):
@@ -404,6 +424,9 @@ class AapError(Exception):
         # instead of concluding that credentials were refused.
         self.transport = transport
 
+
+TIP_TLS = ('[TIP] TLS certificate rejected: set `ca_bundle = /path/to/your-ca.pem` in the '
+           'profile (recommended), or `tls_insecure = true` for a lab only.')
 
 TIPS = {
     401: '[TIP] 401: credentials rejected, or auth method not accepted by this gateway. Check the profile, or create a token and set auth_method = token.',
@@ -430,7 +453,7 @@ def print_error(err, file=None):
     stream = sys.stderr if file is None else file
     print('[ERROR] %s' % err, file=stream)
     detail = getattr(err, 'detail', None)
-    debug = bool(env_value('AAP_DEBUG', 'RHAAP_DEBUG'))
+    debug = debug_enabled()
     # For a transport failure the detail is the list of probed bases: useful for
     # debugging, noise for an operator who mostly needs the one-line tip.
     if detail and (debug or not getattr(err, 'transport', False)):
@@ -511,6 +534,7 @@ class AAPClient:
         self.ca_bundle = ca_bundle
         self._api_bases = None
         self._resource_index = None
+        self._transport_error = None
         self._forced = set()
         self._endpoints = dict(DEFAULT_ENDPOINTS)
         self._resolved = {}
@@ -606,7 +630,7 @@ class AAPClient:
             # Django uses SameSite=Lax with strict Referer checking
             req.add_header('Referer', self.base + '/')
 
-        if env_value('AAP_DEBUG', 'RHAAP_DEBUG'):
+        if debug_enabled():
             print('# > %s %s (auth=%s)' % (method, self.abs_url(path), self.auth_method),
                   file=sys.stderr)
         try:
@@ -621,13 +645,12 @@ class AAPClient:
         except urllib.error.URLError as exc:
             reason = getattr(exc, 'reason', exc)
             if 'CERTIFICATE_VERIFY_FAILED' in str(reason) or 'SSL' in type(reason).__name__:
-                raise AapError(
-                    """TLS certificate rejected for %s
-  -> ca_bundle = /path/to/my-ca.pem in the profile (recommended), or
-  -> tls_insecure = true to disable verification""" % self.base)
+                # transport=True + TIP_TLS: a certificate rejection must not be
+                # reported later as an authentication failure.
+                raise join_failure(self.base, reason)
             return None, [], str(reason)
         except ssl.SSLError as exc:
-            raise AapError('TLS error to %s: %s' % (self.base, exc))
+            raise join_failure(self.base, 'TLS: %s' % exc)
         except OSError as exc:
             raise AapError('network error to %s: %s'
                            % (self.base, getattr(exc, 'strerror', None) or exc))
@@ -678,7 +701,7 @@ class AAPClient:
                 url += ('&' if '?' in url else '?') + query
         status, hdrs, text = self.http(url, method, body, headers, follow=follow, auth=auth)
         if status is None:
-            if not quiet and env_value('AAP_DEBUG', 'RHAAP_DEBUG'):
+            if not quiet and debug_enabled():
                 print('[ERROR] %s %s : %s' % (method, self.abs_url(url), str(text)[:300]),
                       file=sys.stderr)
             raise AapError('cannot reach %s: %s' % (self.base, text or 'no response'),
@@ -709,21 +732,24 @@ class AAPClient:
         for base in self.api_bases():
             candidates.append(base.rstrip('/') + '/login/')
         errors, seen = [], set()
-        silence, last_transport = 0, None
+        silence, last_transport, tls_failure = 0, None, False
         for path in candidates:
             if path in seen:
                 continue
             seen.add(path)
             try:
-                status, hdrs, _ = self.http(path, auth=False,
-                                            headers={'Accept': 'text/html, */*'})
+                status, hdrs, text = self.http(path, auth=False,
+                                               headers={'Accept': 'text/html, */*'})
             except AapError as exc:
                 errors.append('%s: %s' % (rel_url(path, self.base), exc))
                 silence += 1
                 last_transport = str(exc)
+                tls_failure = tls_failure or getattr(exc, 'tip', None) == TIP_TLS
                 continue
             if status is None:
                 silence += 1
+                last_transport = text or 'no HTTP response'
+                tls_failure = tls_failure or _is_tls_error(text)
             for value in hdr_all(hdrs, 'set-cookie'):
                 if 'csrftoken=' in value:
                     csrf = value.split('csrftoken=', 1)[1].split(';')[0].strip()
@@ -733,11 +759,14 @@ class AAPClient:
                         return found
             errors.append('%s: HTTP %s, no csrftoken cookie'
                           % (rel_url(path, self.base), status))
-        if candidates and silence == len(candidates):
+        if seen and silence == len(seen):
+            reason = (_failure_reason(last_transport, self.base)
+                      if last_transport else 'probe silent')
             raise AapError('cannot reach %s while fetching the CSRF token: %s'
-                           % (self.base, last_transport or 'probe silent'),
+                           % (self.base, reason),
                            detail='; '.join(errors) or None,
-                           tip=transport_tip(self.base), transport=True)
+                           tip=TIP_TLS if tls_failure else transport_tip(self.base),
+                           transport=True)
         raise AapError('no login endpoint found to obtain a CSRF token',
                        detail='; '.join(errors) or None)
 
@@ -919,6 +948,7 @@ class AAPClient:
         # prevents reaching the server is not information to discard; it is
         # the only useful answer when no base could be verified.
         transport_error = None
+        tls_failure = False
         candidates = self.published_bases() or list(API_BASE_FALLBACKS)
         for base in candidates:
             root = base if base.endswith('/') else base + '/'
@@ -927,8 +957,13 @@ class AAPClient:
                 status, _, text = self.http(root, auth=False)
             except AapError as exc:
                 status, text = None, str(exc)
-            if status is None and transport_error is None:
-                transport_error = text or 'no HTTP response'
+                tls_failure = tls_failure or getattr(exc, 'tip', None) == TIP_TLS
+            else:
+                if status is None:
+                    tls_failure = tls_failure or _is_tls_error(text)
+            if status is None:
+                if transport_error is None:
+                    transport_error = text or 'no HTTP response'
             if status is not None:
                 probes = [version for version in self.versions_of(self.parse_body(text))
                           if version.startswith(root)]
@@ -939,6 +974,7 @@ class AAPClient:
                 except AapError as exc:
                     if transport_error is None:
                         transport_error = str(exc)
+                    tls_failure = tls_failure or getattr(exc, 'tip', None) == TIP_TLS
                     continue
                 if status is None:
                     # Neither an HTTP response nor an exception: the server does not respond at
@@ -946,6 +982,7 @@ class AAPClient:
                     # to an already wasted delay and drown out the real cause.
                     if transport_error is None:
                         transport_error = text or 'no HTTP response'
+                    tls_failure = tls_failure or _is_tls_error(text)
                     break
                 if 200 <= status < 300 and isinstance(self.parse_body(text), dict):
                     working.append(probe)
@@ -961,9 +998,11 @@ class AAPClient:
             self._transport_error = transport_error
             if transport_error:
                 raise AapError(
-                    'cannot reach %s: %s' % (self.base, transport_error),
+                    'cannot reach %s: %s'
+                    % (self.base, _failure_reason(transport_error, self.base)),
                     detail='tested bases: %s' % ', '.join(candidates),
-                    tip=transport_tip(self.base), transport=True)
+                    tip=TIP_TLS if tls_failure else transport_tip(self.base),
+                    transport=True)
             # The server responds but none of its bases verifies: a real
             # case (components mounted anywhere); keep the default paths
             # and warn; it is up to the operator to override.
@@ -1047,10 +1086,10 @@ class AAPClient:
                     if not NON_RESOURCE_SEGMENTS.match(segment)]
         resource = segments[-1] if segments else key
         for base in self.api_bases():
-            add(base + resource + '/')
+            add(base.rstrip('/') + '/' + resource + '/')
             add(base.rstrip('/') + '/' + path.lstrip('/'))
         for base in API_BASE_FALLBACKS:
-            add(base + resource + '/')
+            add(base.rstrip('/') + '/' + resource + '/')
         return tries
 
     def resolve(self, key, probe_params=None):
@@ -1077,6 +1116,7 @@ class AAPClient:
         probed = []
         silence = 0                    # probes with no HTTP response at all
         last_transport = None
+        tls_failure = False
         forced = self._forced_endpoint(key)
         if forced:
             # Path imposed by the operator (--endpoint or the [endpoints] section
@@ -1094,14 +1134,16 @@ class AAPClient:
                 probed.append('%s[%s]' % (rel_url(candidate, self.base), exc))
                 silence += 1
                 last_transport = str(exc)
+                tls_failure = tls_failure or getattr(exc, 'tip', None) == TIP_TLS
                 continue
             if status is None:
                 silence += 1
                 last_transport = text or 'no HTTP response'
+                tls_failure = tls_failure or _is_tls_error(text)
             probed.append('%s[%s]' % (rel_url(candidate, self.base), status))
             if self._route_is_served(status, text):
                 self._resolved[key] = candidate
-                if env_value('AAP_DEBUG', 'RHAAP_DEBUG'):
+                if debug_enabled():
                     print('#   resolve %s -> %s' % (key, candidate), file=sys.stderr)
                 return candidate
         detail = ('probes: %s' % ', '.join(probed)) if probed else 'no candidate URL'
@@ -1110,9 +1152,13 @@ class AAPClient:
         # failure saves the operator from hunting for credentials
         # when no request reached the server.
         if probed and silence == len(probed):
+            reason = (_failure_reason(last_transport, self.base)
+                      if last_transport else 'probe silent')
             raise AapError('cannot reach %s (%d probe(s)): %s'
-                           % (self.base, len(probed), last_transport or 'probe silent'),
-                           detail=detail, tip=transport_tip(self.base), transport=True)
+                           % (self.base, len(probed), reason),
+                           detail=detail,
+                           tip=TIP_TLS if tls_failure else transport_tip(self.base),
+                           transport=True)
         # Targeted diagnosis: a route that answers 401/403 everywhere is not
         # absent; authentication failed. The right tip has nothing
         # to do with a real 404, and users rarely guess it.
@@ -1184,6 +1230,10 @@ class AAPClient:
                 _, _, raw = self.request(path, headers={'Accept': accept}, follow=True,
                                          quiet=True)
             except AapError as exc:
+                if getattr(exc, 'transport', False):
+                    # Another Accept value cannot fix a dead connection: report
+                    # the real cause (and its tip) instead of retrying twice.
+                    raise
                 # last resort: report the real error, not the fallback detail
                 errors.append('%s%s -> HTTP %s' % (rel_url(path, self.base), accept,
                                                    exc.status))
@@ -1193,7 +1243,7 @@ class AAPClient:
                                detail='; '.join(errors))
             text = self._stdout_as_text(raw)
             if text is not None:
-                if env_value('AAP_DEBUG', 'RHAAP_DEBUG'):
+                if debug_enabled():
                     print('#   stdout: %s (Accept: %s)'
                           % (rel_url(path, self.base), accept), file=sys.stderr)
                 return text
@@ -1217,26 +1267,63 @@ class AAPClient:
             return None
         return text
 
-    def paginated(self, path, limit=None, params=None, max_pages=200):
+    def paginated(self, path, limit=None, params=None, max_pages=200, match=None):
         """
         Walk pages (offset/limit as well as page/page_size).
+
+        `match` optionally filters while paging: the walk stops as soon as
+        `limit` matching items are collected, so a caller can search a whole
+        collection without loading it all into memory.
+
+        `next`/`next_url` links are only followed on the configured host: a
+        redirect to another origin would receive the Authorization header.
         """
+        if limit is not None and limit <= 0:
+            return []
         collected = []
+        matched = []
         page_params = dict(params or {})
         current = path
+        base_parts = urllib.parse.urlparse(self.base)
+        seen = set()
         for _ in range(max_pages):
+            signature = (current, tuple(sorted(page_params.items())))
+            if signature in seen:
+                break
+            seen.add(signature)
             data = self.get_json(current, params=page_params)
             items = to_list(data)
-            collected.extend(items)
-            if limit is not None and len(collected) >= limit:
-                return collected[:limit]
+            if match is None:
+                collected.extend(items)
+                if limit is not None and len(collected) >= limit:
+                    return collected[:limit]
+            else:
+                for item in items:
+                    if match(item):
+                        matched.append(item)
+                        if limit is not None and len(matched) >= limit:
+                            return matched[:limit]
             nxt = next_url(data) if isinstance(data, dict) else ''
             if not items or not nxt:
                 break
             parsed = urllib.parse.urlparse(nxt)
-            page_params = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
-            current = nxt if parsed.scheme else parsed.path
-        return collected
+            if parsed.netloc or parsed.scheme:
+                same_host = parsed.netloc.lower() == base_parts.netloc.lower()
+                same_scheme = (parsed.scheme or base_parts.scheme).lower() == \
+                    base_parts.scheme.lower()
+                if not (same_host and same_scheme):
+                    raise AapError(
+                        'refusing a pagination link to another host: %s' % nxt,
+                        detail='expected %s://%s; the request was not sent'
+                               % (base_parts.scheme, base_parts.netloc))
+            next_params = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            next_current = nxt if parsed.scheme else parsed.path
+            # A server that repeats the same `next` without a page marker would
+            # otherwise be fetched until max_pages, duplicating the same items.
+            if (next_current, tuple(sorted(next_params.items()))) == signature:
+                break
+            page_params, current = next_params, next_current
+        return matched if match is not None else collected
 
     def summarize(self):
         return {'host': self.base, 'auth_method': self.auth_method,
@@ -1335,6 +1422,15 @@ def emit(items, headers, widths, renderer=None):
     print('(%d item(s))' % len(rows))
 
 
+def _csv_value(value):
+    """
+    CSV cell: nested structures are serialized as JSON.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return value
+
+
 def emit_mapping(data, key_label='key'):
     mode = app_state.output
     if mode == 'json':
@@ -1343,7 +1439,7 @@ def emit_mapping(data, key_label='key'):
     if mode == 'yaml':
         print('\n'.join(to_yaml(data)))
         return
-    rows = [[key, value] for key, value in data.items()]
+    rows = [[key, _csv_value(value)] for key, value in data.items()]
     if mode == 'csv':
         writer = csv.writer(sys.stdout)
         writer.writerow([key_label, 'value'])
@@ -1351,15 +1447,6 @@ def emit_mapping(data, key_label='key'):
         return
     for line in table(rows, [key_label, ''], [20, 'auto']):
         print(line)
-
-
-def _csv_value(value):
-    """
-    CSV cell: nested structures are serialized as JSON.
-    """
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, default=str)
-    return value
 
 
 def emit_raw(data):
@@ -1415,7 +1502,12 @@ def cmd_status(args):
             else:
                 data[key] = payload
         except AapError as exc:
-            data[key + '_error'] = 'HTTP %s' % exc.status
+            if getattr(exc, 'transport', False):
+                data[key + '_error'] = 'no response'
+            elif exc.status is not None:
+                data[key + '_error'] = 'HTTP %s' % exc.status
+            else:
+                data[key + '_error'] = str(exc)
     emit_mapping(data)
     return 0
 
@@ -1441,7 +1533,8 @@ def cmd_whoami(args):
                      if v is None or isinstance(v, (str, int, float, bool))}
         if len(shown) < len(data):
             hidden = [k for k in data if k not in shown]
-            print('# %d field(s) masked (hash/internal email/linked field); --full to see everything, but the password field remains a secret'
+            print('# %d field(s) masked (password hash/internal fields); '
+                  '--full shows everything and exposes the password hash'
                   % len(hidden), file=sys.stderr)
     else:
         shown = data
@@ -1461,17 +1554,23 @@ def cmd_templates(args):
     client = app_state.client
     key = 'workflow_job_templates' if args.workflow else 'job_templates'
     path = client.resolve(key)
-    params = {'page_size': min(args.limit, 200)}
+    needle = args.name.lower() if args.name and not args.exact else None
+    # A substring search must scan the collection: filtering after --limit items
+    # would hide a match located further. Use the server cap while scanning.
+    params = {'page_size': 200 if needle else min(args.limit, 200)}
     if args.name and args.exact:
         params['name'] = args.name
-    items = client.paginated(path, limit=args.limit, params=params)
-    if args.name and not args.exact:
-        needle = args.name.lower()
-        items = [i for i in items if needle in str(i.get('name', '')).lower()]
+    items = client.paginated(
+        path, limit=args.limit, params=params,
+        match=(lambda item: needle in str(item.get('name', '')).lower())
+        if needle else None)
     if args.only_ids:
         for item in items:
             print(item.get('id'))
         return 0
+    if args.fields and app_state.output not in ('json', 'yaml'):
+        warn('--fields is ignored with --output %s; use --output json or yaml'
+             % app_state.output)
     if args.fields and app_state.output in ('json', 'yaml'):
         wanted = [f.strip() for f in args.fields.split(',') if f.strip()]
         projected = []
@@ -1513,11 +1612,24 @@ def cmd_jobs(args):
     client = app_state.client
     path = client.resolve('job_runs')
     params = {'page_size': min(args.limit, 200), 'order_by': args.order}
-    if args.template:
-        params['job_template__name'] = args.template
     if args.status:
         params['status'] = args.status
+    if args.template:
+        params['job_template__name'] = args.template
     items = client.paginated(path, limit=args.limit, params=params)
+    if args.template:
+        needle = args.template.lower()
+        items = [i for i in items
+                 if needle in str(template_name(i) or '').lower()]
+        if not items and args.limit > 0:
+            # `job_template__name` is an exact server-side filter: a substring
+            # would return nothing. Reload with a broad scan and filter locally,
+            # like `logs --template`.
+            params.pop('job_template__name', None)
+            params['page_size'] = 200
+            items = client.paginated(
+                path, limit=args.limit, params=params,
+                match=lambda item: needle in str(template_name(item) or '').lower())
     if args.only_ids:
         for item in items:
             print(item.get('id'))
@@ -1597,7 +1709,7 @@ def cmd_logs(args):
     if not stdout_url:
         stdout_url = runs_base.rstrip('/') + '/%s/stdout/' % job_id
 
-    if env_value('AAP_DEBUG', 'RHAAP_DEBUG'):
+    if debug_enabled():
         print('# stdout <- %s' % rel_url(stdout_url, client.base), file=sys.stderr)
     # get_stdout(), not request(): the endpoint depends on content
     # negotiation, and a default Accept would return the JSON envelope instead of the log.
@@ -1829,7 +1941,8 @@ for _name in ('status', 'users', 'organizations'):
 
 def make_parser(spec, prog):
     parser = argparse.ArgumentParser(prog=prog, description=spec['help'])
-    parser.add_argument('--limit', type=int, default=None, help='maximum number of items')
+    parser.add_argument('--limit', type=non_negative_int, default=None,
+                        help='maximum number of items')
     parser.add_argument('--output', choices=['table', 'json', 'csv', 'yaml'], default=None,
                         help='output format (valid for every command)')
     if spec['options']:
@@ -1846,7 +1959,9 @@ def dispatch(name, argv):
     args = make_parser(spec, 'aap_api_cli %s' % name).parse_args(argv)
     if args.output:
         app_state.output = args.output
-    args.limit = args.limit or app_state.limit
+    # `--limit 0` is a real value (no item), not "unset".
+    if args.limit is None:
+        args.limit = app_state.limit
     app_state.limit = args.limit
     return spec['action'](args)
 
@@ -1878,6 +1993,19 @@ commands: %s   (detailed help: help <cmd>)"""
                 pass
         except ImportError:
             pass
+
+    def cmdloop(self, intro=None):
+        """
+        Keep the shell alive on Ctrl-C: cmd.Cmd does not catch KeyboardInterrupt,
+        so an interruption at the prompt (or during a command not caught by
+        _shell_runner) would otherwise close the session and skip postloop().
+        """
+        while True:
+            try:
+                return super().cmdloop(intro)
+            except KeyboardInterrupt:
+                print('^C')
+                intro = ''
 
     def _completer(self, text, state):
         import readline
@@ -1974,6 +2102,8 @@ def _shell_runner(name):
             pass
         except BrokenPipeError:
             pass
+        except KeyboardInterrupt:
+            print('^C', file=sys.stdout)
         except Exception as exc:
             print_error(AapError('%s: %s' % (type(exc).__name__, exc)), file=sys.stdout)
         finally:
@@ -1991,9 +2121,10 @@ CONFIG_TEMPLATE = """# aap_api_cli -- INI configuration file
 #
 # One profile = one platform.  chmod 600 %(path)s
 #
-# Password sources, highest priority first:
-#   `pass` key in the profile  |  --ask-password  |  --password-stdin
-#   --password-env AAP_PASSWORD  |  --password-cmd 'pass show aap/admin'
+# Password sources, highest priority first (see read_passe()):
+#   --password-stdin  |  --password-env AAP_PASSWORD
+#   --password-cmd 'pass show aap/admin'  |  `pass` key in the profile
+#   otherwise interactive prompt (--ask-password forces it; terminal only)
 
 [default]
 host = aap.apps.example.internal
@@ -2015,8 +2146,8 @@ timeout = 30
 # Autodetection finds the bases published by the server on its own. Force here
 # only what it cannot guess (a component not mounted on this vhost).
 # [endpoints]
-# job_templates = /api/controller/api/v2/job_templates/
-# job_runs = /api/controller/api/v2/job_runs/
+# job_templates = /api/controller/v2/job_templates/
+# job_runs = /api/controller/v2/jobs/
 """
 
 
@@ -2173,6 +2304,8 @@ def build_args(argv):
                         help='disable TLS certificate verification')
     parser.add_argument('--ca-bundle', help='CA file (PEM) used to verify the certificate')
     parser.add_argument('--timeout', type=int, help='HTTP timeout in seconds (default 30)')
+    parser.add_argument('--limit', type=non_negative_int, default=None,
+                        help='maximum number of items (works before or after the command)')
     parser.add_argument('--endpoint', action='append', metavar='KEY=/PATH',
                         help='override a logical endpoint (repeatable)')
     parser.add_argument('--list-profiles', action='store_true',
@@ -2210,6 +2343,8 @@ def _run(argv=None):
     app_state = AppState()
     app_state.config_path = os.path.expanduser(args.config_file)
     app_state.output = args.output
+    if args.limit is not None:
+        app_state.limit = args.limit
     if args.verbose:
         os.environ['AAP_DEBUG'] = '1'
         app_state.debug = True
@@ -2261,12 +2396,11 @@ def _run(argv=None):
             detail = getattr(failure, 'detail', None)
             if detail:
                 print('  %s' % str(detail)[:600].replace('\n', ' '), file=sys.stderr)
-            if client.auth_method == 'basic':
+            tip = _error_tip(failure) if failure is not None else None
+            if tip:
+                print(tip, file=sys.stderr)
+            elif client.auth_method == 'basic':
                 print('[TIP] the gateway rejects Basic: try --auth session, check the profile, or create a token (auth_method = token).', file=sys.stderr)
-            else:
-                tip = _error_tip(failure) if failure is not None else None
-                if tip:
-                    print(tip, file=sys.stderr)
             return 1
         if app_state.debug or name in ('status', 'whoami'):
             print('[*] %s' % message, file=sys.stderr)
