@@ -60,6 +60,10 @@ timeout = 30
 placeholder to the server. For a test environment only, `tls_insecure = true`
 is available and produces a warning on every run.
 
+If you already have a `KUBECONFIG` for the cluster that hosts AAP, you do not
+need a config file at all: see
+[No profile: use the OpenShift cluster](#no-profile-use-the-openshift-cluster-kubeconfig).
+
 ### 3. Find a template, its jobs, and their logs
 
 Most people come here to answer three questions: *which template should I
@@ -108,6 +112,37 @@ the tool choose the only profile (or `[default]`):
 ./aap_api_cli.py --list-profiles
 ./aap_api_cli.py -P controller status
 ```
+
+### No profile: use the OpenShift cluster (`KUBECONFIG`)
+
+When no profile is available and `KUBECONFIG` is exported, the CLI can configure
+itself from the cluster. It then runs `oc` twice:
+
+1. `oc get route -n aap` → host of the route named `automation-platform`;
+2. `oc get secret -n aap automation-platform-admin-password` → the base64
+   `data.password`, decoded and used as the `admin` password.
+
+```bash
+export KUBECONFIG=~/.kube/config
+./aap_api_cli.py whoami                     # no config file needed
+./aap_api_cli.py --from-openshift whoami    # force it even if a profile exists
+```
+
+`oc` must be on `PATH` (or set `AAP_OC_BIN`). `--from-openshift` (alias
+`--kubeconfig`) forces this mode; without `KUBECONFIG`, a profile is still
+required. A profile always wins over an inherited `KUBECONFIG` unless
+`--from-openshift` is given.
+
+Explicit CLI values keep priority: `--host`, `--user`, `--token`, and the
+password options (`--password-stdin`, `--password-env`, ...). The namespace,
+route, and secret names can be overridden with `AAP_OC_NAMESPACE`,
+`AAP_OC_ROUTE`, and `AAP_OC_SECRET`; the login defaults to `admin`
+(`AAP_OC_USER`).
+
+OpenShift routes usually present the cluster ingress CA, which the system does
+not trust, so KUBECONFIG mode defaults to `tls_insecure` and says so on every
+run. Set `AAP_OC_TLS_INSECURE=0` to enforce verification, or pass `--ca-bundle`
+/ `AAP_OC_CA_BUNDLE` (either one keeps verification on).
 
 ### Supported configuration keys
 
@@ -240,6 +275,7 @@ Useful on any command:
 | `--auth basic\|session\|token` | Override the authentication method |
 | `--token TOKEN` | Bearer token (or use the profile's `token`); `--jeton` is a hidden legacy alias |
 | `--no-login` | Skip the startup authentication check |
+| `--from-openshift` | No profile: read host/password through `oc` + `$KUBECONFIG` (alias `--kubeconfig`) |
 | `--ca-bundle PEM`, `--insecure` | TLS verification controls |
 | `--timeout N` | HTTP timeout |
 | `--limit N` | Maximum number of items (before or after the command) |
@@ -374,8 +410,14 @@ python3 -m unittest discover -s tests -v
 | Variable | Effect |
 |---|---|
 | `AAP_PROFILE` | Default profile when `-P` is absent |
+| `KUBECONFIG` | Without a profile, enables the OpenShift route/secret mode (`oc` required) |
 | `AAP_DEBUG=1` | Trace HTTP requests and endpoint resolution on stderr (only truthy values; `0`/`false` disable) |
 | `AAP_PASSE` | Only used when passed via `--password-env AAP_PASSE` |
+| `AAP_OC_BIN` | `oc` executable for KUBECONFIG mode (default `oc`) |
+| `AAP_OC_NAMESPACE`, `AAP_OC_ROUTE`, `AAP_OC_SECRET` | Cluster coordinates (defaults `aap`, `automation-platform`, `automation-platform-admin-password`) |
+| `AAP_OC_USER` | Login used in KUBECONFIG mode (default `admin`) |
+| `AAP_OC_TLS_INSECURE` | Defaults to on in KUBECONFIG mode; set `0` to verify the certificate |
+| `AAP_OC_CA_BUNDLE` | CA bundle for KUBECONFIG mode (keeps verification on) |
 
 `RHAAP_PROFILE` and `RHAAP_DEBUG` remain accepted as legacy aliases for scripts
 written before the rename to `AAP_*`.
@@ -402,7 +444,7 @@ AAP_DEBUG=1 ./aap_api_cli.py endpoints
 
 ## Current limitations
 
-- `0.1`: the business commands still need revalidation against the real target.
+- `0.1.1`: the business commands still need revalidation against the real target.
 - The test mock does not model a real `/api/controller/v2/` and only serves
   `text/plain` stdout; the `Accept`-negotiation fallback for logs is therefore
   not exercised by the suite.

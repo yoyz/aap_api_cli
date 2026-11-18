@@ -43,6 +43,7 @@ _TMPDIR = None
 _MOCK = None
 _MOCK_LOG = None
 _MOCK_LOG_HANDLE = None
+FAKE_OC = None
 
 RESULTS = []
 VERBOSE = '-v' in sys.argv or '--verbose' in sys.argv
@@ -135,9 +136,42 @@ def stop_mock():
         _TMPDIR = None
 
 
+def write_fake_oc():
+    """Faux `oc` : route et secret comme le cluster reel, sans cluster."""
+    global FAKE_OC
+    FAKE_OC = os.path.join(_TMPDIR, 'fake_oc')
+    script = '''#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+mode = os.environ.get('FAKE_OC_MODE', '')
+host = os.environ.get('FAKE_OC_HOST', 'http://127.0.0.1:__PORT__')
+if args[:2] == ['get', 'route']:
+    if mode == 'no-route':
+        items = []
+    else:
+        items = [
+            {'metadata': {'name': 'other'}, 'spec': {'host': 'other.example'}},
+            {'metadata': {'name': 'automation-platform'}, 'spec': {'host': host}},
+        ]
+    print(json.dumps({'items': items}))
+elif args[:2] == ['get', 'secret']:
+    data = {} if mode == 'no-password' else {'password': 'dGVzdHBhc3M='}
+    print(json.dumps({'data': data}))
+else:
+    sys.stderr.write('unexpected oc arguments: %r\\n' % (args,))
+    sys.exit(2)
+'''.replace('__PORT__', str(_PORT))
+    with open(FAKE_OC, 'w', encoding='utf-8') as handle:
+        handle.write(script)
+    os.chmod(FAKE_OC, 0o755)
+
+
 def start_mock():
     """Lance le mock et ecrit la config. Leve RuntimeError si le port ne repond pas."""
-    global _PORT, _TMPDIR, _MOCK, _MOCK_LOG, _MOCK_LOG_HANDLE, CONF, LOCAL
+    global _PORT, _TMPDIR, _MOCK, _MOCK_LOG, _MOCK_LOG_HANDLE, CONF, LOCAL, FAKE_OC
     if not os.path.exists(MOCK):
         raise RuntimeError('mock introuvable: %s' % MOCK)
     _TMPDIR = tempfile.mkdtemp(prefix='aap-tests-')
@@ -172,6 +206,7 @@ def start_mock():
                            % (_PORT, log or '(aucun log)'))
 
     write_config(CONF)
+    write_fake_oc()
     # Repertoire HOME ne contenant que l'ancien nom de config : il doit etre
     # ignore (pas de repli), ce que verifie suite_config().
     legacy_home = os.path.join(_TMPDIR, 'legacy-home')
@@ -197,7 +232,10 @@ def fail(message):
 def run(argv, stdin=None, env=None):
     environ = dict(os.environ)
     for name in ('AAP_DEBUG', 'RHAAP_DEBUG', 'AAP_PROFILE', 'RHAAP_PROFILE',
-                 'AAP_PASSE'):
+                 'AAP_PASSE', 'KUBECONFIG', 'AAP_OC_BIN', 'AAP_OC_NAMESPACE',
+                 'AAP_OC_ROUTE', 'AAP_OC_SECRET', 'AAP_OC_USER',
+                 'AAP_OC_TLS_INSECURE', 'AAP_OC_CA_BUNDLE', 'AAP_OC_CA_FILE',
+                 'FAKE_OC_MODE', 'FAKE_OC_HOST'):
         environ.pop(name, None)
     if _TMPDIR:
         # Le shell interactif ecrit ~/.aap_api_cli_history : on l'isole.
@@ -690,6 +728,49 @@ def suite_robustesse():
           verify=want_clean_error('--limit'))
 
 
+def suite_openshift():
+    print('\n--- KUBECONFIG (sans profil) ---')
+    kube = {'KUBECONFIG': os.path.join(_TMPDIR, 'kubeconfig'),
+            'AAP_OC_BIN': FAKE_OC,
+            'AAP_OC_USER': 'testuser',
+            'AAP_OC_TLS_INSECURE': '0'}
+    check('KUBECONFIG sans profil -> whoami',
+          ['-f', CONF + '.absent', 'whoami'], env=dict(kube),
+          verify=want_out('testuser'))
+    check('--from-openshift ignore le profil existant',
+          ['-f', CONF, '--from-openshift', 'whoami'], env=dict(kube),
+          verify=want_out('testuser'))
+    check('profil prioritaire sur KUBECONFIG',
+          LOCAL + ['whoami'],
+          env={'KUBECONFIG': kube['KUBECONFIG'],
+               'AAP_OC_BIN': os.path.join(_TMPDIR, 'absent-oc')},
+          verify=want_out('testuser'))
+    check('TLS insecure par defaut est annonce en mode KUBECONFIG',
+          ['-f', CONF + '.absent', 'whoami'],
+          env={'KUBECONFIG': kube['KUBECONFIG'], 'AAP_OC_BIN': FAKE_OC,
+               'AAP_OC_USER': 'testuser'},
+          verify=want_err('TLS verification DISABLED'))
+    check('ni profil ni KUBECONFIG -> erreur qui explique les deux voies',
+          ['-f', CONF + '.absent', 'whoami'], env={'AAP_OC_BIN': FAKE_OC},
+          expect=1, verify=want_clean_error('--generate-config', 'KUBECONFIG'))
+    check('oc introuvable -> erreur claire',
+          ['-f', CONF + '.absent', 'whoami'],
+          env={'KUBECONFIG': kube['KUBECONFIG'],
+               'AAP_OC_BIN': os.path.join(_TMPDIR, 'absent-oc')},
+          expect=1, verify=want_clean_error('not found'))
+    check('route absente -> nom de la route et du namespace',
+          ['-f', CONF + '.absent', 'whoami'],
+          env=dict(kube, FAKE_OC_MODE='no-route'), expect=1,
+          verify=want_clean_error('automation-platform', 'aap'))
+    check('secret sans cle password -> erreur claire',
+          ['-f', CONF + '.absent', 'whoami'],
+          env=dict(kube, FAKE_OC_MODE='no-password'), expect=1,
+          verify=want_clean_error('password', 'automation-platform-admin-password'))
+    check('--from-openshift et -P sont incompatibles',
+          ['-f', CONF, '--from-openshift', '-P', 'local', 'whoami'],
+          env=dict(kube), expect=1, verify=want_clean_error('cannot be combined'))
+
+
 def port():
     return _PORT
 
@@ -705,7 +786,8 @@ def main():
     log_tail = ''
     try:
         for suite in (suite_config, suite_auth, suite_templates, suite_pagination,
-                      suite_logs, suite_api, suite_shell, suite_robustesse):
+                      suite_logs, suite_api, suite_shell, suite_robustesse,
+                      suite_openshift):
             suite()
     finally:
         log_tail = mock_log_tail()

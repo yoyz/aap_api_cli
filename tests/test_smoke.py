@@ -108,7 +108,7 @@ class SmokeTest(unittest.TestCase):
     def test_version(self):
         proc = self.run_cli('--version')
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn('aap_api_cli 0.1', proc.stdout)
+        self.assertIn('aap_api_cli 0.1.1', proc.stdout)
 
     def test_help_exposes_token_option(self):
         proc = self.run_cli('--help')

@@ -15,7 +15,7 @@ Principles:
 Main commands: templates (job templates), logs (job output), jobs.
 """
 
-VERSION = '0.1'
+VERSION = '0.1.1'
 
 import os
 import re
@@ -25,10 +25,12 @@ import json
 import cmd
 import csv
 import base64
+import binascii
 import shlex
 import getpass
 import argparse
 import configparser
+import subprocess
 import http.cookiejar
 import urllib.request
 import urllib.error
@@ -2121,6 +2123,10 @@ CONFIG_TEMPLATE = """# aap_api_cli -- INI configuration file
 #
 # One profile = one platform.  chmod 600 %(path)s
 #
+# No profile? With $KUBECONFIG exported and the oc CLI installed, the tool can
+# read the route `automation-platform` and the admin password from the secret
+# `automation-platform-admin-password` (namespace `aap`): see --from-openshift.
+#
 # Password sources, highest priority first (see read_passe()):
 #   --password-stdin  |  --password-env AAP_PASSWORD
 #   --password-cmd 'pass show aap/admin'  |  `pass` key in the profile
@@ -2231,6 +2237,24 @@ def build_creds(section, args):
     return Credentials(login, passe, jeton, method)
 
 
+def apply_endpoint_overrides(client, config, args):
+    """
+    [endpoints] section, then --endpoint; shared by profiles and KUBECONFIG mode.
+    """
+    if config is not None and config.has_section('endpoints'):
+        for key, value in config['endpoints'].items():
+            if value.strip():
+                try:
+                    client.set_endpoint(key, value)
+                except AapError as exc:
+                    warn('endpoints.%s ignored: %s' % (key, exc))
+    for override in (args.endpoint or []):
+        if '=' not in override:
+            raise AapError('--endpoint expects key=/path, got %r' % override)
+        key, value = override.split('=', 1)
+        client.set_endpoint(key.strip(), value.strip())
+
+
 def build_client(config, profile, args):
     if profile not in config:
         raise AapError('profile %r not in %s (profiles: %s)'
@@ -2252,19 +2276,162 @@ def build_client(config, profile, args):
                        % (profile, raw_timeout)) from None
     client = AAPClient(host, creds, insecure=insecure, ca_bundle=ca_bundle,
                        timeout=timeout)
+    apply_endpoint_overrides(client, config, args)
+    return client
 
-    if config.has_section('endpoints'):
-        for key, value in config['endpoints'].items():
-            if value.strip():
-                try:
-                    client.set_endpoint(key, value)
-                except AapError as exc:
-                    warn('endpoints.%s ignored: %s' % (key, exc))
-    for override in (args.endpoint or []):
-        if '=' not in override:
-            raise AapError('--endpoint expects key=/path, got %r' % override)
-        key, value = override.split('=', 1)
-        client.set_endpoint(key.strip(), value.strip())
+
+# ---------------------------------------------------------------------------
+# KUBECONFIG mode: no profile, ask the cluster through `oc`
+# ---------------------------------------------------------------------------
+
+KUBE_NAMESPACE = 'aap'
+KUBE_ROUTE = 'automation-platform'
+KUBE_SECRET = 'automation-platform-admin-password'
+KUBE_USER = 'admin'
+
+
+def _kube_setting(name, default):
+    return (os.environ.get(name) or '').strip() or default
+
+
+def oc_binary():
+    return _kube_setting('AAP_OC_BIN', 'oc')
+
+
+def oc_json(arguments):
+    """
+    Run `oc <arguments> -o json` and return the parsed document.
+
+    KUBECONFIG (and the current oc context) are inherited from the environment:
+    that is the cluster selector the operator already chose, so no --context or
+    --kubeconfig is added behind their back.
+    """
+    command = [oc_binary()] + list(arguments) + ['-o', 'json']
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True,
+                              timeout=60, check=False)
+    except FileNotFoundError:
+        raise AapError(
+            "%s not found in PATH, required for KUBECONFIG mode\n"
+            "  -> install the OpenShift CLI (oc), set AAP_OC_BIN=/path/to/oc,\n"
+            "     or use a profile (-P) / --generate-config" % command[0]) from None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AapError('cannot run %s: %s' % (command[0], exc)) from None
+    if proc.returncode != 0:
+        # oc errors mention names, never secret values: safe to display.
+        detail = (proc.stderr or proc.stdout or '').strip()
+        raise AapError('`%s` failed (exit %d): %s'
+                       % (' '.join(command), proc.returncode,
+                          detail[:400] or 'no output'))
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        # Do not echo stdout: `oc get secret -o json` carries the base64
+        # password, and a wrapper could interleave it with other text.
+        raise AapError('`%s` did not return valid JSON (stderr: %s)'
+                       % (' '.join(command),
+                          (proc.stderr or '').strip()[:200] or 'empty')) from None
+
+
+def route_host(route):
+    """
+    Host published by a route: `spec.host` first, then an admitted ingress entry.
+    """
+    spec = route.get('spec') or {}
+    if spec.get('host'):
+        return spec['host']
+    status = route.get('status') or {}
+    for ingress in status.get('ingress') or []:
+        if ingress.get('host'):
+            return ingress['host']
+    return None
+
+
+def openshift_route_host(namespace=None, route_name=None):
+    namespace = namespace or _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE)
+    route_name = route_name or _kube_setting('AAP_OC_ROUTE', KUBE_ROUTE)
+    data = oc_json(['get', 'route', '-n', namespace])
+    items = data.get('items') if isinstance(data, dict) else None
+    if items is None:
+        items = [data] if isinstance(data, dict) and data.get('metadata') else []
+    for route in items:
+        if ((route.get('metadata') or {}).get('name') or '') != route_name:
+            continue
+        host = route_host(route)
+        if not host:
+            raise AapError('route %s/%s has no host yet (not admitted by the router?)'
+                           % (namespace, route_name))
+        return host
+    names = sorted(((route.get('metadata') or {}).get('name') or '?')
+                   for route in items)
+    raise AapError('route %r not found in namespace %r (available: %s)'
+                   % (route_name, namespace, ', '.join(names) or 'none'))
+
+
+def openshift_admin_password(namespace=None, secret_name=None):
+    namespace = namespace or _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE)
+    secret_name = secret_name or _kube_setting('AAP_OC_SECRET', KUBE_SECRET)
+    data = oc_json(['get', 'secret', '-n', namespace, secret_name])
+    payload = (data.get('data') or {}) if isinstance(data, dict) else {}
+    encoded = payload.get('password')
+    if not encoded:
+        # stringData is only present on freshly created objects, but it costs
+        # nothing to accept it and it makes the error below more accurate.
+        encoded = ((data.get('stringData') or {}).get('password')
+                   if isinstance(data, dict) else None)
+        if not encoded:
+            raise AapError('secret %s/%s has no `password` key in its data'
+                           % (namespace, secret_name))
+        return encoded
+    try:
+        return base64.b64decode(str(encoded).strip(), validate=True).decode('utf-8')
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        raise AapError('secret %s/%s: `password` is not valid base64/UTF-8'
+                       % (namespace, secret_name)) from None
+
+
+def build_kube_client(config, args):
+    """
+    No profile: route -> host, secret -> admin password, using $KUBECONFIG.
+
+    Explicit CLI values still win: --host, --user, --token, and any password
+    source (--password-stdin/-env/-cmd/--ask-password). TLS verification stays
+    on by default when a CA bundle is supplied; the OpenShift router usually
+    presents a certificate the system does not trust, so KUBECONFIG mode
+    defaults to tls_insecure (loudly), overridable with AAP_OC_TLS_INSECURE=0.
+    """
+    namespace = _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE)
+    route_name = _kube_setting('AAP_OC_ROUTE', KUBE_ROUTE)
+    secret_name = _kube_setting('AAP_OC_SECRET', KUBE_SECRET)
+    host = args.host or openshift_route_host(namespace, route_name)
+    login = (args.user or _kube_setting('AAP_OC_USER', KUBE_USER)).strip()
+    jeton = (args.jeton or '').strip()
+    method = args.auth or ('token' if jeton else 'basic')
+    if method == 'token':
+        if not jeton:
+            raise AapError('--auth token needs --token (KUBECONFIG mode has no token source)')
+        passe = ''
+    elif any((args.password_stdin, args.password_env, args.password_cmd,
+              args.ask_password)):
+        # An explicit password source overrides the cluster secret.
+        passe = read_passe({}, args, label='%s@%s' % (login, host))
+    else:
+        passe = openshift_admin_password(namespace, secret_name)
+    creds = Credentials(login, passe, jeton, method)
+
+    ca_bundle = (args.ca_bundle or os.environ.get('AAP_OC_CA_BUNDLE')
+                 or os.environ.get('AAP_OC_CA_FILE') or None)
+    if args.insecure:
+        insecure = True
+    elif ca_bundle:
+        insecure = False
+    else:
+        # Default stays permissive for the cluster's own ingress CA, but the
+        # existing warning is printed on every run.
+        insecure = bool(yesno(os.environ.get('AAP_OC_TLS_INSECURE', 'true')))
+    client = AAPClient(host, creds, insecure=insecure, ca_bundle=ca_bundle,
+                       timeout=args.timeout or 30)
+    apply_endpoint_overrides(client, config, args)
     return client
 
 
@@ -2314,6 +2481,12 @@ def build_args(argv):
                         help='print a config file template')
     parser.add_argument('--no-login', action='store_true',
                         help='skip the auth check before the command (saves a round trip)')
+    parser.add_argument('--from-openshift', '--kubeconfig', dest='from_openshift',
+                        action='store_true',
+                        help='no profile: read the host from route %s/%s and the '
+                             'admin password from secret %s/%s via oc/$KUBECONFIG'
+                             % (KUBE_NAMESPACE, KUBE_ROUTE,
+                                KUBE_NAMESPACE, KUBE_SECRET))
     parser.add_argument('--output', choices=['table', 'json', 'csv', 'yaml'], default='table',
                         help='universal output format (default: table)')
     parser.add_argument('-v', '--verbose', action='store_true', help='trace HTTP requests')
@@ -2353,10 +2526,20 @@ def _run(argv=None):
         print_config_template(app_state.config_path)
         return 0
 
-    config = load_config(app_state.config_path)
+    if os.path.exists(app_state.config_path):
+        config = load_config(app_state.config_path)
+    else:
+        # A profile is optional now: KUBECONFIG mode can drive the connection.
+        config = configparser.RawConfigParser(interpolation=None)
     app_state.config = config
 
     if args.list_profiles:
+        if not os.path.exists(app_state.config_path):
+            raise AapError("""no config file: %s
+  -> aap_api_cli.py --generate-config > %s && chmod 600 %s
+  -> or use KUBECONFIG / --from-openshift (no profile needed)"""
+                           % (app_state.config_path, app_state.config_path,
+                              app_state.config_path))
         sections = [s for s in config.sections() if s != 'endpoints']
         print('profiles in %s:' % app_state.config_path)
         for name in sections:
@@ -2365,12 +2548,39 @@ def _run(argv=None):
             print('  (none)')
         return 0
 
-    profile = resolve_profile(config, args.profile)
-    if not profile:
-        raise AapError('no default profile; choose one with -P from: %s'
-                       % ', '.join(s for s in config.sections() if s != 'endpoints'))
-    app_state.profile = profile
-    app_state.client = build_client(config, profile, args)
+    if args.from_openshift and args.profile:
+        raise AapError('--from-openshift cannot be combined with -P/--profile')
+
+    profile = None if args.from_openshift else resolve_profile(config, args.profile)
+    kube_mode = bool(args.from_openshift)
+    if not kube_mode and profile is None:
+        if env_value('KUBECONFIG'):
+            # No profile, but the operator exported a cluster: use it directly.
+            kube_mode = True
+        else:
+            raise AapError("""no default profile; choose one with -P from: %s
+  -> or export KUBECONFIG and run again (route %s/%s, secret %s/%s are read with oc)
+  -> aap_api_cli.py --generate-config > %s"""
+                           % (', '.join(s for s in config.sections()
+                                        if s != 'endpoints') or 'none',
+                              _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE),
+                              _kube_setting('AAP_OC_ROUTE', KUBE_ROUTE),
+                              _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE),
+                              _kube_setting('AAP_OC_SECRET', KUBE_SECRET),
+                              app_state.config_path))
+    if kube_mode:
+        source = '$KUBECONFIG' if env_value('KUBECONFIG') else '--from-openshift'
+        print('[*] using %s: route %s/%s, secret %s/%s'
+              % (source,
+                 _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE),
+                 _kube_setting('AAP_OC_ROUTE', KUBE_ROUTE),
+                 _kube_setting('AAP_OC_NAMESPACE', KUBE_NAMESPACE),
+                 _kube_setting('AAP_OC_SECRET', KUBE_SECRET)), file=sys.stderr)
+        app_state.profile = 'openshift'
+        app_state.client = build_kube_client(config, args)
+    else:
+        app_state.profile = profile
+        app_state.client = build_client(config, profile, args)
     client = app_state.client
 
     name = args.command
